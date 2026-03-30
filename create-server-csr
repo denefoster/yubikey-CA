@@ -1,0 +1,217 @@
+#!/bin/bash
+
+HELP=false
+OUTPUT_DIR="server-csr"
+COMMON_NAME=""
+ORGANIZATION="Slush Tech"
+LOCALITY="Wellington"
+STATE="Wellington"
+COUNTRY="NZ"
+DNS_SANS=()
+IP_SANS=()
+KEY_SIZE=4096
+KEY_TYPE="rsa"
+
+while getopts ":hd:C:e:o:l:s:c:a:i:t:" OPTNAME; do
+    case "${OPTNAME}" in
+        h) HELP=true ;;
+        d) OUTPUT_DIR="${OPTARG}" ;;
+        C) COMMON_NAME="${OPTARG}" ;;
+        e) EMAIL_ADDRESS="${OPTARG}" ;;
+        o) ORGANIZATION="${OPTARG}" ;;
+        l) LOCALITY="${OPTARG}" ;;
+        s) STATE="${OPTARG}" ;;
+        c) COUNTRY="${OPTARG}" ;;
+        a) DNS_SANS+=("${OPTARG}") ;;
+        i) IP_SANS+=("${OPTARG}") ;;
+        t) KEY_TYPE="${OPTARG}" ;;
+        :)
+            echo "Missing required argument to '-${OPTARG}'" >&2
+            exit 1
+            ;;
+        ?)
+            echo "Unknown option '-${OPTARG}'" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if ${HELP}; then
+    echo "Usage: ${0##*/} -C COMMON-NAME [OPTIONS]"
+    echo "  -d OUTPUT-DIR        Output directory"
+    echo "  -C COMMON-NAME       Common name"
+    echo "  -e EMAIL-ADDRESS     Email address"
+    echo "  -o ORGANIZATION      Organization"
+    echo "  -l LOCALITY          Locality"
+    echo "  -s STATE             State or Province, optional"
+    echo "  -c COUNTRY           Country code"
+    echo "  -a DNS-SAN           DNS subject Alternative name, can be specified more than once"
+    echo "  -i IP-SAN            IP subject alternative name, can be specified more than once"
+    echo "  -t KEY-TYPE          Private key type, rsa or secp256k1"
+    echo "  -h                   Help message"
+
+    exit 0
+fi
+
+if [[ -z ${COMMON_NAME} && ${OPTIND} -le $# ]]; then
+    COMMON_NAME="${!OPTIND}"
+fi
+
+if [[ -z ${COMMON_NAME} ]]; then
+    echo "No common name specified" >&2
+    exit 1
+fi
+
+if [[ ${COMMON_NAME} =~ [^-a-zA-Z0-9._*] ]]; then
+    echo "Invalid common name '${COMMON_NAME}'" >&2
+    exit 1
+fi
+
+if [[ -n ${EMAIL_ADDRESS} && ! ${EMAIL_ADDRESS} =~ ^[-a-zA-Z0-9_.+\']+@([-a-zA-Z0-9]+\.)+[a-zA-Z]+$ ]]; then
+    echo "Invalid email address '${EMAIL_ADDRESS}'" >&2
+    exit 1
+fi
+
+if [[ -z ${ORGANIZATION} ]]; then
+    echo "No organization name specified" >&2
+    exit 1
+fi
+
+if [[ -z ${COUNTRY} ]]; then
+    echo "No country specified" >&2
+    exit 1
+fi
+
+if [[ ${#COUNTRY} != 2 ]]; then
+    echo "Invalid country '${COUNTRY}'" >&2
+    exit 1
+fi
+
+COUNTRY="${COUNTRY^^}"
+
+if [[ ${#DNS_SANS[@]} -eq 0 ]]; then
+    DNS_SANS+=(${COMMON_NAME})
+fi
+
+if [[ ! ${DNS_SANS[@]} =~ ${COMMON_NAME} ]]; then
+    DNS_SANS+=(${COMMON_NAME})
+fi
+
+for DNS_SAN in "${DNS_SANS[@]}"; do
+    if [[ ${DNS_SAN} =~ [^-a-zA-Z0-9._*] ]]; then
+        echo "Invalid DNS subject alternative name '${DNS_SAN}'" >&2
+        exit 1
+    fi
+done
+
+for IP_SAN in "${IP_SANS[@]}"; do
+    if ! [[ ${IP_SAN} =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo "Invalid IP subject alternative name '${IP_SAN}'" >&2
+        exit 1
+    fi
+done
+
+if ! [[ ${KEY_TYPE} =~ ^(rsa|secp256k1)$ ]]; then
+    echo "Invalid key type '${KEY_TYPE}', please use rsa or secp256k1"
+    exit 1
+fi
+
+OPENSSL="openssl"
+OPENSSL_CONF="${OUTPUT_DIR}/openssl.conf"
+
+echo "Common Name: ${COMMON_NAME}"
+
+if [[ -n ${EMAIL_ADDRESS} ]]; then
+    echo "Email Address: ${EMAIL_ADDRESS}"
+fi
+
+echo "Organization: ${ORGANIZATION}"
+echo "Locality: ${LOCALITY}"
+
+if [[ -n ${STATE} ]]; then
+    echo "State or Province: ${STATE}"
+fi
+
+echo "Country: ${COUNTRY}"
+echo -n "Subject Alternate Names:"
+
+for DNS_SAN in ${DNS_SANS[@]}; do
+    echo -n " ${DNS_SAN}"
+done
+
+for IP_SAN in ${IP_SANS[@]}; do
+    echo -n " ${IP_SAN}"
+done
+
+echo
+
+read -p "Generate CSR with the above attributes? [y/N] " -n 1 REPLY
+echo
+
+if [[ ! ${REPLY} =~ ^[Yy]$ ]]; then
+    exit 1
+fi
+
+# create a temporary openssl.conf
+{
+    echo "[req]"
+    echo "prompt = no"
+    echo "distinguished_name = distinguished_name"
+    echo "req_extensions = req_extensions"
+
+    echo "[distinguished_name]"
+    echo "commonName = ${COMMON_NAME}"
+
+    if [[ -n ${EMAIL_ADDRESS} ]]; then
+        echo "emailAddress = ${EMAIL_ADDRESS}"
+    fi
+
+    echo "organizationName = ${ORGANIZATION}"
+    echo "localityName = ${LOCALITY}"
+
+    if [[ -n ${STATE} ]]; then
+        echo "stateOrProvinceName = ${STATE}"
+    fi
+
+    echo "countryName = ${COUNTRY}"
+
+    echo "[req_extensions]"
+    echo "subjectAltName = @subject_alt_names"
+
+    echo "[subject_alt_names]"
+
+    for (( INDEX=0; INDEX < ${#DNS_SANS[@]}; INDEX++ )); do
+        echo "DNS.${INDEX} = ${DNS_SANS[$INDEX]}" >> "${OUTPUT_DIR}/openssl.conf"
+    done
+
+    for (( INDEX=0; INDEX < ${#IP_SANS[@]}; INDEX++ )); do
+        echo "IP.${INDEX} = ${IP_SANS[$INDEX]}" >> "${OUTPUT_DIR}/openssl.conf"
+    done
+} > "${OUTPUT_DIR}/openssl.conf"
+
+trap "rm \"${OUTPUT_DIR}/openssl.conf\"" EXIT
+
+if [[ ${KEY_TYPE} = "rsa" ]]; then
+    OUTPUT=$(${OPENSSL} genrsa -out "${OUTPUT_DIR}/${COMMON_NAME}.key" ${KEY_SIZE} 2>&1) || {
+        echo "Error: ${OUTPUT}" >&2
+        exit 1
+    }
+elif [[ ${KEY_TYPE} = "secp384r1" ]]; then
+    OUTPUT=$(${OPENSSL} ecparam -name secp384r1 -genkey -noout -out "${OUTPUT_DIR}/${COMMON_NAME}.key" 2>&1) || {
+        echo "Error: ${OUTPUT}" >&2
+        exit 1
+    }
+fi
+
+OUTPUT=$(OPENSSL_CONF="${OPENSSL_CONF}" ${OPENSSL} req -new -batch -sha256 \
+    -key "${OUTPUT_DIR}/${COMMON_NAME}.key" -out "${OUTPUT_DIR}/${COMMON_NAME}.csr" 2>&1) || {
+    echo "Error: ${OUTPUT}" >&2
+    exit 1
+}
+
+echo "Created CSR for ${COMMON_NAME}"
+
+echo "Saved CSR in ${OUTPUT_DIR}/${COMMON_NAME}.csr"
+echo "Saved ${KEY_TYPE} private key in ${OUTPUT_DIR}/${COMMON_NAME}.key"
+
+exit 0
